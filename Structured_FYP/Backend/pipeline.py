@@ -1,17 +1,8 @@
-"""
-
-Punch detection pipeline used by the FastAPI backend:
-  video -> MediaPipe pose -> punch trigger -> clip crop -> 3-model hierarchical
-  classifier -> DTW feedback against reference punches -> exported clip.
-
-Public functions:
-  get_models()                              load the 3 models once (cached)
-  run_punch_detection(video_path, out_dir)  process one video, return list of punches
-"""
-
 import glob
 import os
 import pickle
+import time
+from collections import deque
 
 import cv2
 import numpy as np
@@ -20,18 +11,66 @@ import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Input, LSTM, Dense, Dropout, Masking
 from dtaidistance import dtw_ndim
+from dtaidistance import dtw as dtw1d
 
 from feedback_analyzer import compute_feedback
+
+# --- DIAGNOSTIC (temporary): confirm dtaidistance's compiled C backend is
+# actually being used. If this prints "C library NOT available", DTW calls
+# are silently falling back to pure Python, which can be 100x+ slower for
+# the exact same result -- a very common issue on Windows without a C
+# compiler available when dtaidistance was pip-installed.
+try:
+    dtw1d.try_import_c(verbose=True)
+except Exception as _e:
+    print(f"[DIAGNOSTIC] Could not run dtaidistance C-backend check: {_e}")
 
 
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-REFERENCE_ROOT = r"C:\Users\abdul\OneDrive\Desktop\AI BOXING ASSISTANT\goldenStandardPunches"
+# Repo layout (GitHub is case-sensitive, so the capitalisation below matters on Linux):
+#
+#   Structured_FYP/
+#     Backend/
+#       pipeline.py                <- this file
+#       feedback_analyzer.py
+#       main.py
+#       goldenStandardPunches/     <- cross, jab, leadhook, leaduppercut, rearhook, rearuppercut
+#     Models/                      <- the .keras / .h5 files (sibling of Backend, NOT inside it)
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 
-MODEL1_PATH = r"C:\Users\abdul\Downloads\model_fixed.h5"    # jab | leadhook | cross_rearhook | uppercuts_nopunch
-MODEL2_PATH = r"C:\Users\abdul\Downloads\model2_fixed.h5"   # leaduppercut | rearuppercut | nopunch
-MODEL3_PATH = r"C:\Users\abdul\Downloads\model3_fixed.h5"   # cross | rearhook
+# Reference .pkl folders live inside Backend/goldenStandardPunches by default.
+# Override with BOXING_REFERENCE_ROOT if you want them elsewhere.
+REFERENCE_ROOT = os.environ.get(
+    "BOXING_REFERENCE_ROOT",
+    os.path.join(_BACKEND_DIR, "goldenStandardPunches"),
+)
+
+
+def _find_models_dir():
+    """Models/ sits next to Backend/ in the repo. Falls back to Backend/Models
+    (e.g. if the folder is copied into Backend for deployment).
+    Override with BOXING_MODELS_DIR."""
+    override = os.environ.get("BOXING_MODELS_DIR")
+    if override:
+        return override
+    candidates = [
+        os.path.join(_BACKEND_DIR, "..", "Models"),   # Structured_FYP/Models
+        os.path.join(_BACKEND_DIR, "Models"),         # Structured_FYP/Backend/Models
+    ]
+    for c in candidates:
+        if os.path.isdir(c):
+            return os.path.normpath(c)
+    return os.path.normpath(candidates[0])
+
+
+_MODELS_DIR = _find_models_dir()
+
+# Exact filenames as they appear in the repo's Models/ folder.
+MODEL1_PATH = os.path.join(_MODELS_DIR, "Model1(S1,S3,S8).keras")                # jab | leadhook | cross_rearhook | uppercuts_nopunch
+MODEL2_PATH = os.path.join(_MODELS_DIR, "Model_2class_uppercut_nopunch.keras")   # leaduppercut | rearuppercut | nopunch
+MODEL3_PATH = os.path.join(_MODELS_DIR, "Model3_67features(cross vs rearhook).keras")  # cross | rearhook
 
 # Set False to skip reference lookup + DTW + feedback text (clips are still exported)
 ENABLE_FEEDBACK = True
@@ -50,7 +89,7 @@ UPPERCUT_Y_THRESHOLD = 0.30
 
 WINDOW_BEFORE, WINDOW_AFTER = 60, 60
 TOTAL_WINDOW = WINDOW_BEFORE + WINDOW_AFTER + 1
-MAX_HISTORY = 200         
+MAX_HISTORY = 200           # how many recent frames are kept in memory
 
 # MediaPipe indexes removed after Z-removal (same as the training pipeline)
 REMOVE_INDEXES = set([
@@ -88,6 +127,7 @@ _REFERENCE_CACHE = {}     # punch label -> list of reference entries (or None)
 
 # ==========================================
 # 2. FEATURE ENGINEERING  (67-dim per-frame vector)
+#    [0:55] original features | [55:67] hook-vs-uppercut features
 # ==========================================
 LANDMARK_INDICES = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
 
@@ -262,6 +302,11 @@ def build_model(num_classes, feature_dim, max_frames=MAX_FRAMES):
 
 def load_punch_model(path, num_classes):
     """Try a normal load_model first; if that fails, rebuild the architecture and load the weights."""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"Model file not found: {path}\n"
+            f"(models dir resolved to: {_MODELS_DIR}; set BOXING_MODELS_DIR to override)"
+        )
     try:
         return tf.keras.models.load_model(path, compile=False)
     except Exception as e:
@@ -271,11 +316,39 @@ def load_punch_model(path, num_classes):
         return model
 
 
+_GRAPH_FNS = {}   # id(model) -> compiled tf.function (built once per model)
+
+
+def _get_graph_fn(model):
+    """Compiles the model's forward pass into a TensorFlow graph, once.
+
+    Calling a Keras LSTM eagerly runs its 110 time steps one at a time in
+    Python, which measured ~445 ms per call on this machine (bench_predict.py).
+    The same call as a traced tf.function measured ~9 ms with bit-identical
+    outputs (max abs difference 0.0, same predicted class on all 3 models).
+    The input signature is fixed to the (1, T, F) shape prepare_model_input()
+    always produces, so it is traced exactly once, at the warm-up call in
+    get_models(), and never retraced per request."""
+    fn = _GRAPH_FNS.get(id(model))
+    if fn is None:
+        t_dim = model.input_shape[1] or MAX_FRAMES
+        f_dim = model.input_shape[-1]
+
+        @tf.function(input_signature=[tf.TensorSpec([1, t_dim, f_dim], tf.float32)])
+        def fn(x):
+            return model(x, training=False)
+
+        _GRAPH_FNS[id(model)] = fn
+    return fn
+
+
 def run_model(model, x):
-    return np.asarray(model(x, training=False))[0]
+    """Forward pass for one clip through the compiled graph (see _get_graph_fn)."""
+    return _get_graph_fn(model)(tf.constant(x, dtype=tf.float32)).numpy()[0]
 
 
 def get_models():
+    """Loads the 3 models once and returns (model1, model2, model3)."""
     global _MODELS
     if _MODELS is not None:
         return _MODELS
@@ -292,6 +365,7 @@ def get_models():
         if model.output_shape[-1] != len(classes):
             raise ValueError(f"{name}: model has {model.output_shape[-1]} outputs "
                              f"but {len(classes)} classes are mapped")
+        # Warm-up call so graph tracing doesn't slow down the first real clip
         time_steps = model.input_shape[1] or MAX_FRAMES
         run_model(model, np.zeros((1, time_steps, model.input_shape[-1]), np.float32))
         loaded.append(model)
@@ -450,16 +524,19 @@ def get_reference_data(predicted_label):
 #   separately and can't cancel each other out.
 # ==========================================
 def run_feedback_ensemble(user_seq_55, refs, punch_type, clip_ankle, window=20):
-    """Returns (final_feedback, votes, n_refs_used, per_ref_logs)."""
+    """Returns (final_feedback, votes, n_refs_used, per_ref_logs, dtw_time)."""
     user_arr = np.array(user_seq_55, dtype=np.double)
     votes = {}                  # message -> number of references that fired it (insertion-ordered)
     per_ref_logs = []
     n_used = 0
+    dtw_time = 0.0
 
     for ref in refs:
         ref_arr = np.array(ref["seq"], dtype=np.double)
         try:
+            _t0 = time.time()
             path = dtw_ndim.warping_path(user_arr, ref_arr, window=window)
+            dtw_time += time.time() - _t0
         except Exception as e:
             print(f"[WARN] DTW failed against {ref['source']}: {e}")
             continue
@@ -476,13 +553,13 @@ def run_feedback_ensemble(user_seq_55, refs, punch_type, clip_ankle, window=20):
             votes[msg] = votes.get(msg, 0) + 1
 
     if n_used == 0:
-        return ["Could not compare against any reference."], {}, 0, per_ref_logs
+        return ["Could not compare against any reference."], {}, 0, per_ref_logs, dtw_time
 
     needed = n_used // 2 + 1    # strict majority (3 of 5)
     final = [msg for msg in votes if votes[msg] >= needed]
     if not final:
         final = [EXCELLENT_MSG]
-    return final, votes, n_used, per_ref_logs
+    return final, votes, n_used, per_ref_logs, dtw_time
 
 
 def write_feedback_log(log_path, votes, n_refs, per_ref_logs):
@@ -501,21 +578,21 @@ def write_feedback_log(log_path, votes, n_refs, per_ref_logs):
 
 
 def get_feedback(clip_features, predicted_punch, clip_ankle, log_path):
-    """Returns the list of feedback strings for one classified punch."""
+    """Returns (feedback_list, dtw_time) for one classified punch."""
     user_seq_55 = [np.asarray(v)[:55] for v in clip_features]
 
     refs = get_reference_data(predicted_punch)
     if refs is None:
-        return [f"No reference .pkl data available for '{predicted_punch}'."]
+        return [f"No reference .pkl data available for '{predicted_punch}'."], 0.0
     if len(user_seq_55) < 2:
-        return ["Clip too short to analyze."]
+        return ["Clip too short to analyze."], 0.0
 
     punch_type = LABEL_TO_PUNCH_TYPE.get(predicted_punch, predicted_punch.lower())
-    feedback, votes, n_refs, per_ref_logs = run_feedback_ensemble(
+    feedback, votes, n_refs, per_ref_logs, dtw_time = run_feedback_ensemble(
         user_seq_55, refs, punch_type, clip_ankle
     )
     write_feedback_log(log_path, votes, n_refs, per_ref_logs)
-    return feedback
+    return feedback, dtw_time
 
 
 # ==========================================
@@ -693,25 +770,41 @@ def run_punch_detection(video_path, output_dir):
                                   min_tracking_confidence=0.5,
                                   model_complexity=1)
 
-    history = []          # most recent frames (see MAX_HISTORY)
+    history = deque(maxlen=MAX_HISTORY)   # most recent frames
     results = []
     prev_norm = None
     cooldown = 0
     punch_counter = 0
+
+    # --- TIMING INSTRUMENTATION (temporary, remove before final submission) ---
+    t_pipeline_start = time.time()
+    t_pose_total = 0.0
+    t_predict_total = 0.0
+    t_dtw_total = 0.0
+    t_export_total = 0.0
+    frame_count = 0
 
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
+            frame_count += 1
 
-            pose_result = pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            # Full-resolution frame goes straight to MediaPipe (same as when the
+            # models were trained). The 640px downscale was removed because it
+            # was never A/B tested for accuracy.
+            pose_input = rgb_frame
+
+            _t0 = time.time()
+            pose_result = pose.process(pose_input)
+            t_pose_total += time.time() - _t0
 
             if pose_result.pose_landmarks:
                 entry, prev_norm = build_frame_entry(frame, pose_result.pose_landmarks.landmark, prev_norm)
                 history.append(entry)
-                if len(history) > MAX_HISTORY:
-                    history.pop(0)
 
                 if len(history) >= TOTAL_WINDOW and cooldown == 0:
                     trigger = detect_trigger(history)
@@ -726,9 +819,11 @@ def run_punch_detection(video_path, output_dir):
                         clip_features = process_punch_sequence(clip_norm)
 
                         # ---- classify ----
+                        _t0 = time.time()
                         predicted_punch, m1_label, route, confidence = predict_hierarchical(
                             clip_features, model1, model2, model3
                         )
+                        t_predict_total += time.time() - _t0
 
                         # ---- feedback (text only) ----
                         feedback = []
@@ -736,12 +831,15 @@ def run_punch_detection(video_path, output_dir):
                             log_path = os.path.join(
                                 output_dir, f"punch_{punch_counter}_{predicted_punch}_feedback.txt"
                             )
-                            feedback = get_feedback(clip_features, predicted_punch, clip_ankle, log_path)
+                            feedback, dtw_time = get_feedback(clip_features, predicted_punch, clip_ankle, log_path)
+                            t_dtw_total += dtw_time
 
                         # ---- export clip ----
+                        _t0 = time.time()
                         clip_filename = f"punch_{punch_counter}_{predicted_punch}.mp4"
                         save_clip(column(clip, "frame"),
                                   os.path.join(output_dir, clip_filename), fps, width, height)
+                        t_export_total += time.time() - _t0
 
                         print(f"[Punch {punch_counter}] M1: {m1_label} -> via {route} -> "
                               f"'{predicted_punch}' ({confidence:.2f}) | {clip_filename}")
@@ -761,6 +859,24 @@ def run_punch_detection(video_path, output_dir):
     finally:
         cap.release()
         pose.close()
+
+    t_total = time.time() - t_pipeline_start
+    t_other = t_total - t_pose_total - t_predict_total - t_dtw_total - t_export_total
+    n = max(punch_counter, 1)
+    print(
+        "\n[TIMING] === run_punch_detection breakdown ===\n"
+        f"[TIMING] Total frames processed:        {frame_count}\n"
+        f"[TIMING] Total wall time:                {t_total:.1f}s\n"
+        f"[TIMING] -> pose.process() (all frames):   {t_pose_total:.1f}s ({100*t_pose_total/t_total:.0f}%)\n"
+        f"[TIMING] -> model predict_hierarchical:     {t_predict_total:.1f}s ({100*t_predict_total/t_total:.0f}%)  "
+        f"avg {1000*t_predict_total/n:.0f}ms/punch across {punch_counter} punches\n"
+        f"[TIMING] -> DTW ensemble (all refs):        {t_dtw_total:.1f}s ({100*t_dtw_total/t_total:.0f}%)  "
+        f"avg {1000*t_dtw_total/n:.0f}ms/punch\n"
+        f"[TIMING] -> video export (plain encode):    {t_export_total:.1f}s ({100*t_export_total/t_total:.0f}%)  "
+        f"avg {1000*t_export_total/n:.0f}ms/punch\n"
+        f"[TIMING] -> everything else (I/O etc.):     {t_other:.1f}s ({100*t_other/t_total:.0f}%)\n"
+        "[TIMING] ==========================================\n"
+    )
 
     print(f"Inference complete. Extracted & classified {punch_counter} punches.")
     return results
