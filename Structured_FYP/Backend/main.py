@@ -1,14 +1,15 @@
+import uuid
 import shutil
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
 from pipeline import run_punch_detection, get_models
 
-BASE_URL = "http://127.0.0.1:8000"
+BASE_URL = "https://ai-boxing-assistant-backend.onrender.com" 
 
 UPLOAD_DIR = Path("temp_videos")
 OUTPUT_DIR = Path("detected_punches")
@@ -28,10 +29,11 @@ app.add_middleware(
 # Serves the exported punch clips
 app.mount("/videos", StaticFiles(directory=str(OUTPUT_DIR)), name="videos")
 
+task_store = {}
+
 
 @app.on_event("startup")
 def load_models_on_startup():
-    # Load the 3 Keras models once at startup instead of on every upload
     get_models()
 
 
@@ -40,15 +42,57 @@ def read_root():
     return {"message": "Punch Detection API is online and functional!"}
 
 
+def process_video_background(task_id: str, input_video_path: Path, session_output_dir: Path, session_name: str, safe_name: str):
+    try:
+        task_store[task_id]["status"] = "processing"
+        
+        results = run_punch_detection(
+            video_path=str(input_video_path),
+            output_dir=str(session_output_dir),
+        )
+
+        punches = []
+        punch_counts = {}
+
+        for result in results:
+            label = result["classification"]
+            if label == "NoPunch":
+                continue
+
+            punch_counts[label] = punch_counts.get(label, 0) + 1
+            video_url = f"{BASE_URL}/videos/{quote(session_name)}/{quote(result['clip_filename'])}"
+
+            punches.append({
+                "punch_id": result["punch_id"],
+                "classification": label,
+                "confidence": result["confidence"],
+                "clip_filename": result["clip_filename"],
+                "video_url": video_url,
+                "feedback": result["feedback"],
+            })
+
+        task_store[task_id] = {
+            "status": "completed",
+            "original_video": safe_name,
+            "total_punches_found": len(punches),
+            "punch_counts": punch_counts,
+            "punches": punches,
+        }
+    except Exception as e:
+        task_store[task_id] = {
+            "status": "failed",
+            "error": str(e)
+        }
+
+
 @app.post("/upload-video/")
-def upload_video(file: UploadFile = File(...)):
+async def upload_video(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     content_type = file.content_type or ""
     if not content_type.startswith("video/"):
         raise HTTPException(status_code=400, detail="Uploaded file is not a verified video standard.")
 
-
     safe_name = Path(file.filename).name
-    input_video_path = UPLOAD_DIR / safe_name
+    input_video_path = UPLOAD_DIR / f"{uuid.uuid4()}_{safe_name}"
 
     try:
         with input_video_path.open("wb") as buffer:
@@ -62,40 +106,28 @@ def upload_video(file: UploadFile = File(...)):
     session_output_dir = OUTPUT_DIR / session_name
     session_output_dir.mkdir(exist_ok=True)
 
-    try:
-        results = run_punch_detection(
-            video_path=str(input_video_path),
-            output_dir=str(session_output_dir),
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Core pipeline execution processing fault: {str(e)}")
+    task_id = str(uuid.uuid4())
+    task_store[task_id] = {"status": "queued"}
 
-    # Build the response, skipping 'NoPunch' clips
-    punches = []
-    punch_counts = {}
-
-    for result in results:
-        label = result["classification"]
-        if label == "NoPunch":
-            continue
-
-        punch_counts[label] = punch_counts.get(label, 0) + 1
-
-        video_url = f"{BASE_URL}/videos/{quote(session_name)}/{quote(result['clip_filename'])}"
-
-        punches.append({
-            "punch_id": result["punch_id"],
-            "classification": label,
-            "confidence": result["confidence"],
-            "clip_filename": result["clip_filename"],
-            "video_url": video_url,
-            "feedback": result["feedback"],   # list of text strings for the app
-        })
+    background_tasks.add_task(
+        process_video_background,
+        task_id,
+        input_video_path,
+        session_output_dir,
+        session_name,
+        safe_name
+    )
 
     return {
-        "message": "Processing complete",
-        "original_video": safe_name,
-        "total_punches_found": len(punches),
-        "punch_counts": punch_counts,
-        "punches": punches,
+        "status": "queued",
+        "task_id": task_id,
+        "message": "Video uploaded successfully and is processing in the background."
     }
+
+
+@app.get("/task-status/{task_id}")
+async def get_task_status(task_id: str):
+    if task_id not in task_store:
+        raise HTTPException(status_code=404, detail="Task ID not found.")
+    
+    return task_store[task_id]
