@@ -1,5 +1,7 @@
+import os
 import uuid
 import shutil
+import traceback
 from pathlib import Path
 from urllib.parse import quote
 
@@ -9,7 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from pipeline import run_punch_detection, get_models
 
-BASE_URL = "https://carpenter-sulk-subtract.ngrok-free.dev" 
+# Set BASE_URL in the notebook (os.environ["BASE_URL"] = public_url) before starting uvicorn.
+BASE_URL = os.getenv("BASE_URL", "https://carpenter-sulk-subtract.ngrok-free.dev").rstrip("/")
 
 UPLOAD_DIR = Path("temp_videos")
 OUTPUT_DIR = Path("detected_punches")
@@ -45,7 +48,7 @@ def read_root():
 def process_video_background(task_id: str, input_video_path: Path, session_output_dir: Path, session_name: str, safe_name: str):
     try:
         task_store[task_id]["status"] = "processing"
-        
+
         results = run_punch_detection(
             video_path=str(input_video_path),
             output_dir=str(session_output_dir),
@@ -79,6 +82,8 @@ def process_video_background(task_id: str, input_video_path: Path, session_outpu
             "punches": punches,
         }
     except Exception as e:
+        # Print the full traceback (file + line) to the server log (Colab output)
+        traceback.print_exc()
         task_store[task_id] = {
             "status": "failed",
             "error": str(e)
@@ -108,6 +113,7 @@ async def upload_video(background_tasks: BackgroundTasks, file: UploadFile = Fil
 
     task_id = str(uuid.uuid4())
     task_store[task_id] = {"status": "queued"}
+    print(f"New task: {task_id}", flush=True)
 
     background_tasks.add_task(
         process_video_background,
@@ -129,5 +135,5 @@ async def upload_video(background_tasks: BackgroundTasks, file: UploadFile = Fil
 async def get_task_status(task_id: str):
     if task_id not in task_store:
         raise HTTPException(status_code=404, detail="Task ID not found.")
-    
+
     return task_store[task_id]
