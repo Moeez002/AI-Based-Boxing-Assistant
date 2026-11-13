@@ -715,7 +715,9 @@ def find_adaptive_motion_boundaries(speeds, wrist_dists, elbow_angles, peak_pos,
 
 def crop_punch_clip(history, trigger):
     """Returns the frame entries that make up the punch clip."""
-    window = history[-TOTAL_WINDOW:]
+    # history is a deque, and deques cannot be sliced ("sequence index must be
+    # integer, not 'slice'"), so copy the last TOTAL_WINDOW frames into a list first.
+    window = list(history)[-TOTAL_WINDOW:]
     is_lead = "LEAD" in trigger
     is_rear = "REAR" in trigger
 
