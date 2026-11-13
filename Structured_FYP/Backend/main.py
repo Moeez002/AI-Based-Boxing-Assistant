@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from pipeline import run_punch_detection, get_models
 
-BASE_URL = "https://ai-boxing-assistant-backend.onrender.com" 
+BASE_URL = "https://carpenter-sulk-subtract.ngrok-free.dev" 
 
 UPLOAD_DIR = Path("temp_videos")
 OUTPUT_DIR = Path("detected_punches")
